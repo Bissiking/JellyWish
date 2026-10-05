@@ -1,0 +1,535 @@
+// JellyWish — schéma PostgreSQL
+// https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Authentification / utilisateurs (Kyros OIDC)
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  /// `sub` OIDC fourni par Kyros (identifiant stable, jamais un email)
+  subject      String   @unique
+  email        String?  @unique
+  name         String?
+  givenName    String?
+  familyName   String?
+  nickname     String?
+  avatarUrl    String?
+  /// Rôles remontés du claim `roles` de Kyros
+  roles        String[] @default([])
+  isActive     Boolean  @default(true)
+  isFirstLogin Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  roleMappings        RoleMapping[]
+  userPermissions     UserPermission[]
+  requests            Request[]
+  historyEvents       RequestStatusHistory[]
+  notificationPrefs   NotificationPreference[]
+  notificationHistory NotificationHistory[]
+  auditLogs           AuditLog[]
+
+  @@index([email])
+}
+
+/// Rôle Kyros rattaché à un utilisateur JellyWish
+model RoleMapping {
+  id        String   @id @default(cuid())
+  userId    String
+  role      String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, role])
+  @@index([role])
+}
+
+/// Permission métadonnée (ex. `request.movie`, `settings.manage`)
+model Permission {
+  id          String  @id @default(cuid())
+  key         String  @unique
+  description String?
+  category    String?
+
+  rolePermissions   RolePermission[]
+  userPermissions   UserPermission[]
+  approvalRules     ApprovalRule[]
+  releaseRules      ReleaseRule[]
+
+  @@index([category])
+}
+
+/// Permission accordée à un rôle Kyros
+model RolePermission {
+  id             String @id @default(cuid())
+  role           String
+  permissionKey  String
+  permission     Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@unique([role, permissionKey])
+  @@index([role])
+}
+
+/// Override de permission individuel (positif ou négatif)
+model UserPermission {
+  id            String  @id @default(cuid())
+  userId        String
+  permissionKey String
+  granted       Boolean @default(true)
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@unique([userId, permissionKey])
+}
+
+// ---------------------------------------------------------------------------
+// Demandes
+// ---------------------------------------------------------------------------
+
+enum MediaType {
+  MOVIE
+  SERIES
+}
+
+enum RequestStatus {
+  /// Créée, en attente de décision
+  PENDING
+  /// Approuvée (auto ou manuelle)
+  APPROVED
+  /// Refusée
+  REJECTED
+  /// Ajout Radarr/Sonarr effectué, recherche de releases
+  SEARCHING
+  /// Release sélectionnée, grab envoyé
+  RELEASE_SELECTED
+  /// Téléchargement en cours
+  DOWNLOADING
+  /// Import / rename en cours chez Radarr/Sonarr
+  IMPORTING
+  /// Présent et complet dans Jellyfin
+  AVAILABLE
+  /// Présent mais incomplet (séries)
+  PARTIALLY_AVAILABLE
+  /// Une intégration a échoué
+  ERROR
+}
+
+enum DecisionOutcome {
+  AUTO_APPROVED
+  REVIEW_REQUIRED
+  AUTO_REJECTED
+  MANUAL_APPROVED
+  MANUAL_REJECTED
+}
+
+model Request {
+  id       String        @id @default(cuid())
+  userId   String
+  mediaType MediaType
+  tmdbId   Int
+  /// Métadonnées figées au moment de la demande
+  title        String
+  originalTitle String?
+  year         Int?
+  posterPath   String?
+  backdropPath String?
+  status   RequestStatus @default(PENDING)
+  decision DecisionOutcome?
+
+  /// Justification de la décision (règle gagnante, conditions évaluées…)
+  decisionReason String?
+  /// Raison du refus, visible par l'utilisateur
+  rejectionReason String?
+  /// Règle d'approbation qui a tranché
+  approvalRuleId String?
+  /// Profil de qualité demandé (ex. "1080p")
+  qualityProfile String?
+  /// Saisons demandées (séries) ; vide = série entière
+  requestedSeasons Int[] @default([])
+
+  /// Synchronisation Radarr / Sonarr
+  radarrMovieId Int?
+  sonarrSeriesId Int?
+  /// Synchronisation Jellyfin
+  jellyfinItemId     String?
+  availabilitySyncAt DateTime?
+
+  isComplete    Boolean    @default(false)
+  decidedAt     DateTime?
+  completedAt   DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  user              User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  approvalRule      ApprovalRule?        @relation(fields: [approvalRuleId], references: [id])
+  items             RequestItem[]
+  history           RequestStatusHistory[]
+  releaseCandidates ReleaseCandidate[]
+  releaseDecisions  ReleaseDecision[]
+  workflowTasks     WorkflowTask[]
+
+  @@unique([mediaType, tmdbId, userId])
+  @@index([status])
+  @@index([userId, createdAt])
+}
+
+/// Élément d'une demande : film (un seul) ou saison de série
+model RequestItem {
+  id            String        @id @default(cuid())
+  requestId     String
+  seasonNumber  Int?
+  status        RequestStatus @default(PENDING)
+  episodeCount  Int?
+  availableCount Int          @default(0)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  request Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([requestId, seasonNumber])
+  @@index([status])
+}
+
+/// Timeline persistée d'une demande
+model RequestStatusHistory {
+  id          String   @id @default(cuid())
+  requestId   String
+  fromStatus  RequestStatus?
+  toStatus    RequestStatus
+  /// Libellé humain affiché dans la timeline
+  message     String?
+  /// Détails structurés (règle, release rejetée, progression…)
+  metadata    Json?
+  actorUserId String?
+  createdAt   DateTime @default(now())
+
+  request  Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  actor    User?   @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([requestId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Moteur de règles d'approbation
+// ---------------------------------------------------------------------------
+
+enum RuleResult {
+  AUTO_APPROVED
+  REVIEW_REQUIRED
+  AUTO_REJECTED
+}
+
+enum MatchMode {
+  ALL
+  ANY
+}
+
+model ApprovalRule {
+  id          String      @id @default(cuid())
+  name        String
+  description String?
+  enabled     Boolean     @default(true)
+  priority    Int         @default(100)
+  result      RuleResult
+  matchMode   MatchMode   @default(ALL)
+  /// Texte d'explication enregistré dans l'historique de la demande
+  explanation String?
+  /// Restreint la règle à un type de média
+  mediaType   MediaType?
+  createdById String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  conditions ApprovalRuleCondition[]
+  permission  Permission? @relation(fields: [permissionKey], references: [key])
+  permissionKey String?
+  requests    Request[]
+
+  @@index([enabled, priority])
+}
+
+model ApprovalRuleCondition {
+  id       String  @id @default(cuid())
+  ruleId   String
+  /// Champ évalué : user.role, media.genre, media.rating, quality.max, infra.diskFree…
+  field    String
+  operator String  @default("eq")
+  /// Valeur sérialisée (JSON) : nombre, chaîne, booléen, liste
+  value    Json
+
+  rule ApprovalRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@index([ruleId])
+}
+
+// ---------------------------------------------------------------------------
+// Moteur de sélection des releases
+// ---------------------------------------------------------------------------
+
+enum ReleaseAction {
+  ACCEPT
+  REJECT
+  PREFER
+}
+
+model ReleaseRule {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  enabled     Boolean   @default(true)
+  priority    Int       @default(100)
+  action      ReleaseAction
+  matchMode   MatchMode @default(ALL)
+  /// Pondération appliquée aux règles PREFER lors du classement
+  weight      Int       @default(10)
+  explanation String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  conditions ReleaseRuleCondition[]
+  permission Permission?            @relation(fields: [permissionKey], references: [key])
+  permissionKey String?
+  decisions  ReleaseDecision[]
+
+  @@index([enabled, priority])
+}
+
+model ReleaseRuleCondition {
+  id       String @id @default(cuid())
+  ruleId   String
+  /// resolution, size, seeders, language, codec, source, hdr, dolbyVision…
+  field    String
+  operator String @default("eq")
+  value    Json
+
+  rule ReleaseRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@index([ruleId])
+}
+
+/// Release remontée par Radarr/Sonarr pour une demande
+model ReleaseCandidate {
+  id          String   @id @default(cuid())
+  requestId   String
+  title       String
+  indexer     String?
+  protocol    String?
+  seeders     Int?
+  leechers    Int?
+  publishDate DateTime?
+  sizeBytes   BigInt?
+  quality     String?
+  resolution   String?
+  source      String?
+  videoCodec  String?
+  audioCodec  String?
+  language    String?
+  hdr         Boolean?
+  dolbyVision Boolean?
+  /// Score calculé par Radarr/Sonarr + Custom Formats
+  arrScore    Int?
+  customFormats String[] @default([])
+  /// Rejet éventuel signalé par Radarr/Sonarr
+  arrRejectionReason String?
+  /// Snapshot complet de la réponse de l'arr
+  raw         Json
+  isEligible  Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  request  Request            @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  decisions ReleaseDecision[]
+
+  @@index([requestId])
+}
+
+/// Décision du moteur de sélection pour une release
+model ReleaseDecision {
+  id                  String        @id @default(cuid())
+  requestId           String
+  releaseCandidateId  String
+  ruleId              String?
+  action              ReleaseAction
+  /// Raisons structurées (+ résolution préférée, + seeders…)
+  reasons             Json?
+  rank                Int           @default(0)
+  score               Int           @default(0)
+  selected            Boolean       @default(false)
+  createdAt           DateTime      @default(now())
+
+  request          Request           @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  releaseCandidate ReleaseCandidate  @relation(fields: [releaseCandidateId], references: [id], onDelete: Cascade)
+  rule             ReleaseRule?      @relation(fields: [ruleId], references: [id])
+
+  @@unique([requestId, releaseCandidateId])
+  @@index([requestId, rank])
+}
+
+// ---------------------------------------------------------------------------
+// Intégrations externes
+// ---------------------------------------------------------------------------
+
+enum IntegrationKind {
+  KYROS
+  TMDB
+  JELLYFIN
+  RADARR
+  SONARR
+  GOTIFY
+  QBITTORRENT
+}
+
+enum HealthStatus {
+  UP
+  DEGRADED
+  DOWN
+  UNKNOWN
+}
+
+/// Configuration non sensible (les secrets vivent dans .env)
+model Integration {
+  id        String          @id @default(cuid())
+  kind      IntegrationKind @unique
+  label     String
+  enabled   Boolean         @default(true)
+  /// URL de base, options non secrètes…
+  settings  Json            @default("{}")
+  health    HealthStatus    @default(UNKNOWN)
+  lastCheckAt DateTime?
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  checks IntegrationHealth[]
+
+  @@index([enabled])
+}
+
+model IntegrationHealth {
+  id            String         @id @default(cuid())
+  integrationId String
+  status        HealthStatus
+  latencyMs     Int?
+  message       String?
+  metadata      Json?
+  checkedAt     DateTime       @default(now())
+
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([integrationId, checkedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications Gotify
+// ---------------------------------------------------------------------------
+
+enum NotificationEvent {
+  REQUEST_CREATED
+  REQUEST_APPROVED
+  REQUEST_REJECTED
+  REVIEW_REQUIRED
+  NO_RELEASE_FOUND
+  DOWNLOAD_STARTED
+  DOWNLOAD_FAILED
+  IMPORT_SUCCEEDED
+  MEDIA_AVAILABLE
+  GENERIC
+}
+
+model NotificationPreference {
+  id        String           @id @default(cuid())
+  userId    String
+  event     NotificationEvent
+  enabled   Boolean          @default(true)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, event])
+}
+
+model NotificationHistory {
+  id        String           @id @default(cuid())
+  userId    String?
+  event     NotificationEvent
+  title     String
+  message   String
+  /// `SENT` / `FAILED` / `SKIPPED`
+  status    String           @default("SENT")
+  error     String?
+  requestId String?
+  createdAt DateTime         @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Jobs / workflows
+// ---------------------------------------------------------------------------
+
+enum TaskStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+  CANCELLED
+}
+
+/// Tâche persistée permettant la reprise des workflows interrompus
+model WorkflowTask {
+  id          String     @id @default(cuid())
+  requestId   String?
+  kind        String
+  status      TaskStatus @default(PENDING)
+  attempts    Int        @default(0)
+  maxAttempts Int        @default(5)
+  runAt       DateTime   @default(now())
+  lockedAt    DateTime?
+  lastError   String?
+  payload     Json       @default("{}")
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  request Request? @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([status, runAt])
+  @@index([requestId])
+}
+
+// ---------------------------------------------------------------------------
+// Administration
+// ---------------------------------------------------------------------------
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String?
+  action      String
+  target      String?
+  metadata    Json?
+  ip          String?
+  createdAt   DateTime @default(now())
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([actorUserId, createdAt])
+}
